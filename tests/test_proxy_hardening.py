@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 import httpx
@@ -380,6 +381,7 @@ class _CapturingTransport(httpx.AsyncBaseTransport):
         return httpx.Response(200, headers={"content-type": "application/json"}, json=body)
 
 
+@contextlib.contextmanager
 def _upstream_capturing_client(*, client=NONLOOPBACK, base_url="http://testserver"):
     reset_compression_store()
     config = ProxyConfig(
@@ -398,8 +400,11 @@ def _upstream_capturing_client(*, client=NONLOOPBACK, base_url="http://testserve
     )
     app = create_app(config)
     transport = _CapturingTransport()
-    app.state.proxy.http_client = httpx.AsyncClient(transport=transport)
-    return TestClient(app, base_url=base_url, client=client), transport
+    with TestClient(app, base_url=base_url, client=client) as c:
+        # Startup builds the real upstream client, so swap it only after
+        # entering the lifespan or requests would leave the test process.
+        app.state.proxy.http_client = httpx.AsyncClient(transport=transport)
+        yield c, transport
 
 
 def _anthropic_request(c, headers):
@@ -429,8 +434,7 @@ class TestProxyTokenIsNotForwardedUpstream:
     """
 
     def test_bearer_token_is_dropped_and_provider_key_kept(self):
-        c, transport = _upstream_capturing_client()
-        with c:
+        with _upstream_capturing_client() as (c, transport):
             resp = _anthropic_request(
                 c, {"x-api-key": "sk-ant-test", "Authorization": f"Bearer {TOKEN}"}
             )
@@ -443,8 +447,7 @@ class TestProxyTokenIsNotForwardedUpstream:
 
     def test_lowercase_scheme_is_dropped_too(self):
         """The gate accepts ``bearer`` in any case, so the scrub must as well."""
-        c, transport = _upstream_capturing_client()
-        with c:
+        with _upstream_capturing_client() as (c, transport):
             resp = _anthropic_request(
                 c, {"x-api-key": "sk-ant-test", "Authorization": f"bearer {TOKEN}"}
             )
@@ -452,8 +455,7 @@ class TestProxyTokenIsNotForwardedUpstream:
         assert "authorization" not in _only_upstream_request(transport).headers
 
     def test_custom_header_is_dropped_and_provider_bearer_kept(self):
-        c, transport = _upstream_capturing_client()
-        with c:
+        with _upstream_capturing_client() as (c, transport):
             resp = c.post(
                 "/v1/chat/completions",
                 headers={"X-Headroom-Proxy-Token": TOKEN, "Authorization": "Bearer sk-test"},
@@ -468,8 +470,7 @@ class TestProxyTokenIsNotForwardedUpstream:
     def test_custom_header_is_dropped_even_with_internal_strip_disabled(self, monkeypatch):
         """``HEADROOM_STRIP_INTERNAL_HEADERS=disabled`` must not leak the credential."""
         monkeypatch.setenv("HEADROOM_STRIP_INTERNAL_HEADERS", "disabled")
-        c, transport = _upstream_capturing_client()
-        with c:
+        with _upstream_capturing_client() as (c, transport):
             resp = _anthropic_request(
                 c, {"x-api-key": "sk-ant-test", "X-Headroom-Proxy-Token": TOKEN}
             )
@@ -478,8 +479,10 @@ class TestProxyTokenIsNotForwardedUpstream:
 
     def test_loopback_caller_token_is_dropped(self):
         """Loopback skips the check, but its token is still not the provider's."""
-        c, transport = _upstream_capturing_client(client=LOOPBACK, base_url="http://127.0.0.1")
-        with c:
+        with _upstream_capturing_client(client=LOOPBACK, base_url="http://127.0.0.1") as (
+            c,
+            transport,
+        ):
             resp = _anthropic_request(
                 c, {"x-api-key": "sk-ant-test", "Authorization": f"Bearer {TOKEN}"}
             )
@@ -487,8 +490,7 @@ class TestProxyTokenIsNotForwardedUpstream:
         assert "authorization" not in _only_upstream_request(transport).headers
 
     def test_catch_all_passthrough_drops_bearer_token(self):
-        c, transport = _upstream_capturing_client()
-        with c:
+        with _upstream_capturing_client() as (c, transport):
             resp = c.get(
                 "/v1/models",
                 headers={"x-api-key": "sk-ant-test", "Authorization": f"Bearer {TOKEN}"},
